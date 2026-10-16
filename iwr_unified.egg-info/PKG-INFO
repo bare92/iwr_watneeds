@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: iwr-unified
+Version: 1.0.0
+Summary: Unified configuration-driven IWR, ET, yield, anomaly and plotting workflow
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0
+Requires-Dist: rasterio>=1.3
+Requires-Dist: pyproj>=3.5
+Requires-Dist: scipy>=1.10
+Requires-Dist: matplotlib>=3.7
+Provides-Extra: geo
+Requires-Dist: geopandas>=0.14; extra == "geo"
+Requires-Dist: shapely>=2.0; extra == "geo"
+Provides-Extra: netcdf
+Requires-Dist: xarray>=2023.1; extra == "netcdf"
+Requires-Dist: netCDF4>=1.6; extra == "netcdf"
+Requires-Dist: rioxarray>=0.15; extra == "netcdf"
+Requires-Dist: dask[array]>=2023.1; extra == "netcdf"
+Provides-Extra: test
+Requires-Dist: pytest>=7; extra == "test"
