@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import time
 from pathlib import Path
+import warnings
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import BoundaryNorm, ListedColormap
@@ -25,24 +26,82 @@ class IWRInputs:
     working_grid: NDArray[np.uint8]
     effective_rainfall: float = 0.95
     debug_mode: bool = False
-    apply_irrigation: bool = True
-    irrigation_mask: NDArray[np.uint8] | None = None  # Optional mask for irrigation application
+    debug_plot_stride: int = 1
+    debug_plot_max_pixels: int = 250_000
+    report_blue_water_requirement: bool = True
+    simulate_irrigation: bool = False
+    irrigation_area_mask: NDArray[np.uint8] | None = None
+
+    # Deprecated compatibility aliases.
+    apply_irrigation: bool | None = None
+    irrigation_mask: NDArray[np.uint8] | None = None
+
+    def __post_init__(self):
+        if self.apply_irrigation is not None:
+            warnings.warn(
+                "'apply_irrigation' is deprecated; use 'report_blue_water_requirement' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.report_blue_water_requirement != self.apply_irrigation and self.report_blue_water_requirement is not True:
+                raise ValueError(
+                    "Contradictory configuration: apply_irrigation and report_blue_water_requirement specify different values."
+                )
+            self.report_blue_water_requirement = self.apply_irrigation
+
+        if self.irrigation_mask is not None:
+            warnings.warn(
+                "'irrigation_mask' is deprecated; use 'irrigation_area_mask' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.irrigation_area_mask is not None:
+                legacy_mask = np.asarray(self.irrigation_mask, dtype=np.uint8)
+                new_mask = np.asarray(self.irrigation_area_mask, dtype=np.uint8)
+                if not np.array_equal(legacy_mask, new_mask):
+                    raise ValueError(
+                        "Contradictory configuration: irrigation_mask and irrigation_area_mask specify different values."
+                    )
+            self.irrigation_area_mask = self.irrigation_mask
 
 
 class IWRModel:
     def __init__(self, inputs: IWRInputs):
         self.inputs = inputs
+        if self.inputs.simulate_irrigation:
+            raise NotImplementedError(
+                "Physical irrigation simulation is not implemented yet. "
+                "simulate_irrigation=True requires a separate irrigation scheduling strategy "
+                "for timing, application depth, efficiency, and water-balance coupling."
+            )
         self._validate_inputs()
 
         self.soil_moisture_mm = None
         self.TAW = None
         self.RAW = None
+        self.critical_storage_mm = None
         self._last_balance_correction_stats = None
-        if inputs.irrigation_mask is not None:
-            self.valid_mask = np.logical_and(self.inputs.working_grid, self.inputs.crop.crop_raster > 0)
-            self.valid_mask = np.logical_and(self.valid_mask, self.inputs.irrigation_mask > 0)
-        else:
-            self.valid_mask = np.logical_and(self.inputs.working_grid, self.inputs.crop.crop_raster > 0)
+        working_grid = np.asarray(self.inputs.working_grid, dtype=np.float32)
+        crop_fraction = np.asarray(self.inputs.crop.crop_raster, dtype=np.float32)
+        domain_mask = np.isfinite(working_grid)
+        self.crop_domain_mask = domain_mask & (crop_fraction > 0.0)
+        if not np.any(self.crop_domain_mask):
+            raise ValueError(
+                "Empty working-domain intersection with positive crop fractions. "
+                "Check the reference raster validity mask and crop fraction raster."
+            )
+        if self.inputs.debug_plot_stride < 1:
+            raise ValueError("debug_plot_stride must be >= 1.")
+        if self.inputs.debug_plot_max_pixels < 1:
+            raise ValueError("debug_plot_max_pixels must be >= 1.")
+
+        self.valid_mask = self.crop_domain_mask
+        self.irrigation_area_mask = self.inputs.irrigation_area_mask
+        if self.irrigation_area_mask is not None:
+            irrigation_area = np.asarray(self.irrigation_area_mask, dtype=np.uint8)
+            if irrigation_area.shape != self.crop_domain_mask.shape:
+                raise ValueError("irrigation_area_mask must have the same spatial dimensions as the crop domain.")
+            self.irrigation_area_mask = irrigation_area > 0
 
     def _validate_inputs(self) -> None:
         if not 0.0 <= self.inputs.effective_rainfall <= 1.0:
@@ -55,8 +114,13 @@ class IWRModel:
             if self.inputs.working_grid.shape != self.inputs.crop.crop_raster.shape[-2:]:
                 raise ValueError("working_grid and crop_raster spatial dimensions do not match.")
 
-        if self.inputs.crop.root_max_depth <= 0:
-            raise ValueError("crop.root_max_depth must be > 0.")
+        if self.inputs.irrigation_area_mask is not None:
+            irrigation_area = np.asarray(self.inputs.irrigation_area_mask, dtype=np.uint8)
+            if irrigation_area.shape != self.inputs.working_grid.shape:
+                raise ValueError("irrigation_area_mask must use the same spatial grid as the working area.")
+
+        if not np.isfinite(self.inputs.crop.root_max_depth) or self.inputs.crop.root_max_depth <= 0:
+            raise ValueError("crop.root_max_depth must be a finite value > 0.")
 
         if not 0.0 <= self.inputs.crop.p <= 1.0:
             raise ValueError("crop.p must be between 0 and 1.")
@@ -65,13 +129,20 @@ class IWRModel:
         wilting_point = np.asarray(self.inputs.soil.wilting_point, dtype=np.float32)
         max_infiltration = np.asarray(self.inputs.soil.max_infiltration_rate, dtype=np.float32)
 
-        if np.any((field_capacity < 0.0) | (field_capacity > 1.0)):
+        valid_soil = np.isfinite(field_capacity) & np.isfinite(wilting_point)
+        if not np.any(valid_soil):
+            raise ValueError("soil field_capacity and wilting_point contain no valid finite values.")
+
+        if not np.all(np.isfinite(max_infiltration[valid_soil])):
+            raise ValueError("soil.max_infiltration_rate contains NaN or infinite values on valid soil pixels.")
+
+        if np.any((field_capacity[valid_soil] < 0.0) | (field_capacity[valid_soil] > 1.0)):
             raise ValueError("soil field_capacity must be a volumetric fraction in the range [0, 1].")
 
-        if np.any((wilting_point < 0.0) | (wilting_point > field_capacity)):
+        if np.any((wilting_point[valid_soil] < 0.0) | (wilting_point[valid_soil] > field_capacity[valid_soil])):
             raise ValueError("soil wilting_point must satisfy 0 <= wilting_point < field_capacity <= 1.")
 
-        if np.any(max_infiltration < 0.0):
+        if np.any(max_infiltration[valid_soil] < 0.0):
             raise ValueError("soil.max_infiltration_rate must be >= 0.")
 
         # The internal soil-water storage is water above wilting point, in mm.
@@ -80,12 +151,13 @@ class IWRModel:
 
     def run(self):
         run_start = time.perf_counter()
-        iwr_path, et_actual_path, soil_moisture_path = self.create_output_directory()
+        iwr_path, et_potential_path, et_actual_path, soil_moisture_path = self.create_output_directory()
         print(f"RUN {self.inputs.crop.name} from {self.inputs.scheduler['time'].min()} to {self.inputs.scheduler['time'].max()}")
 
-        # TAW and RAW are static for the current crop + soil combination, in mm.
+        # TAW, RAW and critical_storage_mm are static for the current crop + soil combination, in mm.
         self.TAW = self._compute_TAW()
         self.RAW = self._compute_RAW()
+        self.critical_storage_mm = self._compute_critical_storage()
 
         self.soil_moisture_mm = self._volumetric_to_storage(self.inputs.soil.soil_moisture)
         self.soil_moisture_mm = np.clip(self.soil_moisture_mm, 0.0, self.TAW)
@@ -166,15 +238,27 @@ class IWRModel:
                         f"maximum residual: {max_balance_error:.6f} mm"
                     )
 
-            # AIDA/WATNEEDS consumptive blue-water requirement:
+            # WATNEEDS consumptive blue-water requirement:
             # additional water required to raise stressed ET to potential ET.
-            # This is not a soil-storage refill-to-RAW irrigation depth.
+            # This is a theoretical demand metric and does not physically irrigate the soil.
             blue_water_mm = self._compute_blue_water_requirement(
                 et_potential_mm=et_potential_mm,
                 et_actual_mm=et_actual_mm,
-                apply_irrigation=self.inputs.apply_irrigation,
             )
-            iwr = blue_water_mm
+            iwr = blue_water_mm.copy()
+            if self.inputs.report_blue_water_requirement:
+                iwr = self._apply_active_crop_mask_to_iwr(
+                    blue_water_mm=iwr,
+                    phenology_state=phenology_state,
+                )
+                if self.inputs.irrigation_area_mask is not None:
+                    iwr = self._apply_irrigation_area_mask_to_iwr(
+                        iwr=iwr,
+                        irrigation_area_mask=self.irrigation_area_mask,
+                    )
+            else:
+                iwr = np.zeros_like(blue_water_mm, dtype=np.float32)
+                iwr[~np.isfinite(blue_water_mm)] = np.nan
 
             if self.inputs.debug_mode and self._last_balance_correction_stats is not None:
                 stats = self._last_balance_correction_stats
@@ -204,13 +288,15 @@ class IWRModel:
             # Raster outputs are written to disk as before.
             formatted_time = pd.Timestamp(row["time"]).strftime("%Y_%m_%d")
             iwr_output_path = iwr_path / f"iwr_{formatted_time}_{self.inputs.crop.name}.tif"
+            et_potential_output_path = et_potential_path / f"et_potential_{formatted_time}.tif"
             et_actual_output_path = et_actual_path / f"et_actual_{formatted_time}.tif"
             soil_moisture_output_path = soil_moisture_path / f"soil_moisture_{formatted_time}.tif"
             self._write_raster(iwr_output_path, iwr, row["p_path"])
+            self._write_raster(et_potential_output_path, et_potential_mm, row["pet_path"])
             self._write_raster(et_actual_output_path, et_actual_mm, row["pet_path"])
             self._write_raster(soil_moisture_output_path, theta_new, row["p_path"])
 
-            if self.inputs.debug_mode:
+            if self.inputs.debug_mode and index % self.inputs.debug_plot_stride == 0:
                 self._save_debug_day_plot(
                     timestamp=row["time"],
                     precipitation_mm=effective_precipitation_mm,
@@ -271,55 +357,93 @@ class IWRModel:
         return theta_wp + storage_mm / (root_depth_m * 1000.0)
 
     def _compute_RAW(self) -> NDArray[np.float32]:
-        # RAW = p * TAW, both in mm.
+        # RAW = p * TAW, both in mm. This is the FAO-56 depletion threshold,
+        # not the remaining storage at which stress begins.
         if self.TAW is None:
             self.TAW = self._compute_TAW()
-        return self.inputs.crop.p * self.TAW
+        raw = self.inputs.crop.p * self.TAW
+        return np.asarray(raw, dtype=np.float32)
+
+    def _compute_critical_storage(self) -> NDArray[np.float32]:
+        # critical_storage_mm = TAW - RAW = (1 - p) * TAW.
+        # This is the remaining soil water storage at the onset of stress.
+        if self.TAW is None:
+            self.TAW = self._compute_TAW()
+        taw = np.asarray(self.TAW, dtype=np.float32)
+        critical_storage_mm = np.full_like(taw, np.nan, dtype=np.float32)
+        valid = np.isfinite(taw)
+        critical_storage_mm[valid] = (1.0 - self.inputs.crop.p) * taw[valid]
+        if not np.any(np.isfinite(critical_storage_mm)):
+            raise ValueError("critical_storage_mm contains no valid finite values for the current crop domain.")
+        return np.asarray(critical_storage_mm, dtype=np.float32)
 
     def _compute_TAW(self) -> NDArray[np.float32]:
         # TAW = (FC - WP) * root_depth * 1000, in mm.
-        return (self.inputs.soil.field_capacity - self.inputs.soil.wilting_point) * self.inputs.crop.root_max_depth * 1000.0
+        field_capacity = np.asarray(self.inputs.soil.field_capacity, dtype=np.float32)
+        wilting_point = np.asarray(self.inputs.soil.wilting_point, dtype=np.float32)
+        root_depth_m = np.asarray(self.inputs.crop.root_max_depth, dtype=np.float32)
+
+        valid = np.isfinite(field_capacity) & np.isfinite(wilting_point) & (field_capacity > wilting_point)
+        taw = np.full_like(field_capacity, np.nan, dtype=np.float32)
+        taw[valid] = (field_capacity[valid] - wilting_point[valid]) * root_depth_m * 1000.0
+
+        if not np.any(np.isfinite(taw)):
+            raise ValueError("Soil parameters produced no valid finite TAW values.")
+        if np.any(np.isfinite(taw) & (taw <= 0.0)):
+            raise ValueError("TAW must be > 0 for a valid soil-water stress calculation on valid soil pixels.")
+        return np.asarray(taw, dtype=np.float32)
 
     def _compute_ks(self) -> NDArray[np.float32]:
-        # Ks = S / RAW if S < RAW, else Ks = 1; must remain between 0 and 1.
+        # Ks = 1 if S >= critical_storage_mm; otherwise Ks = S / critical_storage_mm.
+        # The onset-of-stress threshold is the remaining storage, not the depletion amount.
         if self.soil_moisture_mm is None:
             if self.inputs.soil.soil_moisture is None:
                 raise ValueError("soil_moisture must be initialized before computing Ks.")
             self.soil_moisture_mm = self._volumetric_to_storage(self.inputs.soil.soil_moisture)
             self.soil_moisture_mm = np.clip(self.soil_moisture_mm, 0.0, self.TAW)
 
+        if self.critical_storage_mm is None:
+            self.critical_storage_mm = self._compute_critical_storage()
+
         soil_storage = np.asarray(self.soil_moisture_mm, dtype=np.float32)
-        raw = np.asarray(self.RAW, dtype=np.float32)
+        critical_storage = np.asarray(self.critical_storage_mm, dtype=np.float32)
         ks = np.ones_like(soil_storage, dtype=np.float32)
-        valid = np.isfinite(soil_storage) & np.isfinite(raw) & (raw > 0.0)
-        invalid_mask = valid & (soil_storage < raw)
-        ks[invalid_mask] = soil_storage[invalid_mask] / raw[invalid_mask]
+        valid = np.isfinite(soil_storage) & np.isfinite(critical_storage)
+        stress_pixels = valid & (critical_storage > 0.0) & (soil_storage < critical_storage)
+        ks[stress_pixels] = soil_storage[stress_pixels] / critical_storage[stress_pixels]
         ks = np.clip(ks, 0.0, 1.0)
         ks[~np.isfinite(soil_storage)] = np.nan
         return ks
 
     def _compute_deep_percolation(self) -> NDArray[np.float32]:
-        # D = Fmax * (S - RAW)/(TAW - RAW) for RAW <= S <= TAW; D = 0 otherwise.
+        # D = Fmax * (S - critical_storage_mm) / (TAW - critical_storage_mm)
+        # when S >= critical_storage_mm; otherwise D = 0.
         if self.soil_moisture_mm is None:
             if self.inputs.soil.soil_moisture is None:
                 raise ValueError("soil_moisture must be initialized before computing deep percolation.")
             self.soil_moisture_mm = self._volumetric_to_storage(self.inputs.soil.soil_moisture)
             self.soil_moisture_mm = np.clip(self.soil_moisture_mm, 0.0, self.TAW)
 
+        if self.critical_storage_mm is None:
+            self.critical_storage_mm = self._compute_critical_storage()
+
         soil_storage = np.asarray(self.soil_moisture_mm, dtype=np.float32)
-        raw = np.asarray(self.RAW, dtype=np.float32)
+        critical_storage = np.asarray(self.critical_storage_mm, dtype=np.float32)
         taw = np.asarray(self.TAW, dtype=np.float32)
         deep_percolation = np.zeros_like(soil_storage, dtype=np.float32)
-        denominator = taw - raw
-        valid = np.isfinite(soil_storage) & np.isfinite(denominator)
-        valid &= denominator != 0.0
-        valid &= soil_storage >= raw
+
+        denominator = taw - critical_storage
+        valid = np.isfinite(soil_storage) & np.isfinite(critical_storage) & np.isfinite(denominator)
+        valid &= denominator > 0.0
+        valid &= soil_storage >= critical_storage
         valid &= soil_storage <= taw
 
-        relative_storage = np.zeros_like(soil_storage, dtype=np.float32)
-        relative_storage[valid] = ((soil_storage[valid] - raw[valid]) / denominator[valid])
-        relative_storage = np.clip(relative_storage, 0.0, 1.0)
-        deep_percolation = self.inputs.soil.max_infiltration_rate * relative_storage
+        deep_percolation[valid] = (
+            self.inputs.soil.max_infiltration_rate[valid]
+            * (soil_storage[valid] - critical_storage[valid])
+            / denominator[valid]
+        )
+        deep_percolation = np.maximum(deep_percolation, 0.0)
         deep_percolation[~np.isfinite(soil_storage)] = np.nan
         return deep_percolation
 
@@ -383,21 +507,65 @@ class IWRModel:
 
         return corrected_et_actual_mm, corrected_deep_percolation_mm
 
+    def _apply_active_crop_mask_to_iwr(
+        self,
+        blue_water_mm: NDArray[np.float32],
+        phenology_state: NDArray[np.uint8],
+    ) -> NDArray[np.float32]:
+        blue_water_mm = np.asarray(blue_water_mm, dtype=np.float32)
+        phenology_state = np.asarray(phenology_state, dtype=np.uint8)
+
+        if blue_water_mm.shape != phenology_state.shape:
+            raise ValueError(
+                "blue_water_mm and phenology_state must have the same shape for seasonal IWR masking."
+            )
+
+        active_crop_mask = phenology_state > 0
+        reported_iwr = blue_water_mm.copy()
+        finite_pixels = np.isfinite(reported_iwr)
+        reported_iwr[finite_pixels & (~active_crop_mask)] = 0.0
+        reported_iwr[~finite_pixels] = np.nan
+        return reported_iwr
+
+    def _apply_irrigation_area_mask_to_iwr(
+        self,
+        iwr: NDArray[np.float32],
+        irrigation_area_mask: NDArray[np.uint8],
+    ) -> NDArray[np.float32]:
+        iwr = np.asarray(iwr, dtype=np.float32)
+        irrigation_area_mask = np.asarray(irrigation_area_mask, dtype=bool)
+
+        if iwr.shape != irrigation_area_mask.shape:
+            raise ValueError(
+                "iwr and irrigation_area_mask must have the same shape for irrigated-demand masking."
+            )
+
+        reported_iwr = iwr.copy()
+        finite_pixels = np.isfinite(reported_iwr)
+        reported_iwr[finite_pixels & (~irrigation_area_mask)] = 0.0
+        reported_iwr[~finite_pixels] = np.nan
+        return reported_iwr
+
     def _compute_blue_water_requirement(
         self,
         et_potential_mm: NDArray[np.float32],
         et_actual_mm: NDArray[np.float32],
-        apply_irrigation: bool,
+        apply_irrigation: bool | None = None,
     ) -> NDArray[np.float32]:
+        if apply_irrigation is not None:
+            warnings.warn(
+                "'apply_irrigation' is deprecated for _compute_blue_water_requirement(); "
+                "the function calculates theoretical blue-water demand only.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         et_potential_mm = np.asarray(et_potential_mm, dtype=np.float32)
         et_actual_mm = np.asarray(et_actual_mm, dtype=np.float32)
 
         blue_water_mm = np.full_like(et_potential_mm, np.nan, dtype=np.float32)
         finite_pixels = np.isfinite(et_potential_mm) & np.isfinite(et_actual_mm)
-        if apply_irrigation:
-            blue_water_mm[finite_pixels] = np.maximum(0.0, et_potential_mm[finite_pixels] - et_actual_mm[finite_pixels])
-        else:
-            blue_water_mm[finite_pixels] = 0.0
+        blue_water_mm[finite_pixels] = np.maximum(0.0, et_potential_mm[finite_pixels] - et_actual_mm[finite_pixels])
 
         return blue_water_mm
 
@@ -419,17 +587,42 @@ class IWRModel:
         return runoff_mm, soil_storage_new
 
     def _get_kc_for_time(self, time_value) -> NDArray[np.float32]:
-        day_of_year = int(pd.Timestamp(time_value).dayofyear)
+        ts = pd.Timestamp(time_value)
+        month_lengths = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        day_index = sum(month_lengths[: ts.month - 1]) + ts.day - 1
         max_day = self.inputs.phenology.Kc_matrix.values.shape[0] - 1
-        day_index = min(max(day_of_year - 1, 0), max_day)
+        day_index = min(max(day_index, 0), max_day)
         return self.inputs.phenology.Kc_matrix.values[day_index].astype(np.float32)
 
-    def _get_phenology_state_for_time(self, time_value) -> NDArray[np.uint8]:
-        day_of_year = int(pd.Timestamp(time_value).dayofyear)
-        daily_state = self.inputs.phenology._state_to_daily()
-        max_day = daily_state.shape[0] - 1
-        day_index = min(max(day_of_year - 1, 0), max_day)
-        return daily_state[day_index].astype(np.uint8)
+    def _get_phenology_state_for_time(
+        self, time_value
+    ) -> NDArray[np.uint8]:
+        ts = pd.Timestamp(time_value)
+
+        # Three calendar dekads per month.
+        # The final dekad includes every day from the 21st onward.
+        dekad_index = (
+            3 * (ts.month - 1)
+            + min((ts.day - 1) // 10, 2)
+        )
+
+        return self.inputs.phenology.state.values[
+            dekad_index
+        ].astype(np.uint8)
+
+    @staticmethod
+    def _prepare_debug_plot_array(
+        array: NDArray[np.float32] | NDArray[np.uint8],
+        max_pixels: int = 250_000,
+    ) -> NDArray[np.float32] | NDArray[np.uint8]:
+        arr = np.asarray(array)
+        if arr.ndim != 2 or arr.size <= max_pixels:
+            return arr
+
+        step = max(1, int(np.ceil(np.sqrt(arr.size / max_pixels))))
+        if step == 1:
+            return arr
+        return arr[::step, ::step]
 
     def _save_debug_day_plot(
         self,
@@ -443,21 +636,22 @@ class IWRModel:
         soil_moisture_mm: NDArray[np.float32],
         iwr: NDArray[np.float32],
     ) -> None:
-        debug_dir = Path(self.inputs.output_dir) / self.inputs.crop.name /  "debug_png"
+        debug_dir = Path(self.inputs.output_dir) / self.inputs.crop.name / "debug_png"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-        fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+        max_pixels = max(1, self.inputs.debug_plot_max_pixels)
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10), constrained_layout=True)
         axes = axes.ravel()
 
         plots = [
-            ("precipitation (mm)", precipitation_mm, "Blues"),
-            ("kc (-)", kc_map, "viridis"),
-            ("phenology_state", phenology_state, "phenology"),
-            ("et0 (mm)", et0_mm, "YlOrRd"),
-            ("actual_et (mm)", et_actual_mm, "OrRd"),
-            ("deep_percolation (mm)", deep_percolation_mm, "PuBu"),
-            ("soil_moisture_end (mm)", soil_moisture_mm, "YlGn"),
-            ("blue water / IWR (mm)", iwr, "RdPu"),
+            ("precipitation (mm)", self._prepare_debug_plot_array(precipitation_mm, max_pixels), "Blues"),
+            ("kc (-)", self._prepare_debug_plot_array(kc_map, max_pixels), "viridis"),
+            ("phenology_state", self._prepare_debug_plot_array(phenology_state, max_pixels), "phenology"),
+            ("et0 (mm)", self._prepare_debug_plot_array(et0_mm, max_pixels), "YlOrRd"),
+            ("actual_et (mm)", self._prepare_debug_plot_array(et_actual_mm, max_pixels), "OrRd"),
+            ("deep_percolation (mm)", self._prepare_debug_plot_array(deep_percolation_mm, max_pixels), "PuBu"),
+            ("soil_moisture_end (mm)", self._prepare_debug_plot_array(soil_moisture_mm, max_pixels), "YlGn"),
+            ("blue water / IWR (mm)", self._prepare_debug_plot_array(iwr, max_pixels), "RdPu"),
         ]
 
         for ax, (title, data, cmap) in zip(axes, plots):
@@ -479,11 +673,10 @@ class IWRModel:
 
         day_label = pd.Timestamp(timestamp).strftime("%Y_%m_%d")
         fig.suptitle(f"{self.inputs.crop.name} - {day_label}", fontsize=14)
-        fig.tight_layout(rect=[0, 0, 1, 0.97])
-        fig.savefig(debug_dir / f"{self.inputs.crop.name}_{day_label}_debug.png", dpi=150, bbox_inches="tight")
+        fig.savefig(debug_dir / f"{self.inputs.crop.name}_{day_label}_debug.png", dpi=100, bbox_inches="tight")
         plt.close(fig)
 
-    def create_output_directory(self) -> tuple[Path, Path, Path]:
+    def create_output_directory(self) -> tuple[Path, Path, Path, Path]:
         output_path = Path(self.inputs.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
@@ -493,11 +686,14 @@ class IWRModel:
         iwr_path = curr_crop_path / "iwr"
         iwr_path.mkdir(parents=True, exist_ok=True)
 
+        et_potential_path = curr_crop_path / "et_potential"
+        et_potential_path.mkdir(parents=True, exist_ok=True)
+
         et_actual_path = curr_crop_path / "et_actual"
         et_actual_path.mkdir(parents=True, exist_ok=True)
 
         soil_moisture_path = curr_crop_path / "soil_moisture"
         soil_moisture_path.mkdir(parents=True, exist_ok=True)
 
-        return iwr_path, et_actual_path, soil_moisture_path
+        return iwr_path, et_potential_path, et_actual_path, soil_moisture_path
 

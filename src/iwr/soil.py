@@ -10,6 +10,7 @@ from rasterio.warp import transform_bounds
 import rasterio
 from iwr.tools import weighted_average_rasters_by_depth
 from rasterio.warp import reproject, Resampling
+from scipy.ndimage import distance_transform_edt
 
 
 SOIL_PARAMETERS = {
@@ -27,6 +28,60 @@ SOIL_PARAMETERS = {
     12: {"name": "Loamy sand",       "wp": 0.08, "fc": 0.16, "fmax": 500},
     13: {"name": "Sand",             "wp": 0.06, "fc": 0.13, "fmax": 720},
 }
+
+
+def _build_soil_property_rasters(texture_map: NDArray[np.uint8]) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
+    field_capacity = np.full(texture_map.shape, np.nan, dtype=np.float32)
+    wilting_point = np.full(texture_map.shape, np.nan, dtype=np.float32)
+    max_infiltration_rate = np.full(texture_map.shape, np.nan, dtype=np.float32)
+
+    for soil_id, params in SOIL_PARAMETERS.items():
+        mask = texture_map == soil_id
+        field_capacity[mask] = params["fc"]
+        wilting_point[mask] = params["wp"]
+        max_infiltration_rate[mask] = params["fmax"]
+
+    return field_capacity, wilting_point, max_infiltration_rate
+
+
+def _fill_internal_nodata_holes(
+    raster: NDArray[np.float32],
+    valid_mask: NDArray[np.bool_] | None = None,
+) -> NDArray[np.float32]:
+    """Fill NaN values within a valid mask using nearest finite raster values."""
+    array = np.asarray(raster, dtype=np.float32)
+    if array.ndim != 2:
+        raise ValueError("raster must be a 2D array")
+
+    if valid_mask is None:
+        valid_region = np.ones(array.shape, dtype=bool)
+    else:
+        valid_region = np.asarray(valid_mask, dtype=bool)
+        if valid_region.shape != array.shape:
+            raise ValueError("valid_mask must have the same shape as raster")
+
+    fill_targets = valid_region & np.isnan(array)
+    if not np.any(fill_targets):
+        return array.copy()
+
+    source_mask = valid_region & np.isfinite(array)
+    if not np.any(source_mask):
+        raise ValueError(
+            "Cannot fill NaN values inside valid_mask because no finite source pixels exist within valid_mask."
+        )
+
+    nearest_indices = distance_transform_edt(
+        ~source_mask,
+        return_distances=False,
+        return_indices=True,
+    )
+
+    filled = array.copy()
+    filled[fill_targets] = array[
+        nearest_indices[0][fill_targets],
+        nearest_indices[1][fill_targets],
+    ].astype(np.float32)
+    return filled
 
 @dataclass
 class Soil:
@@ -46,16 +101,7 @@ class Soil:
 
     @classmethod
     def from_texture(cls, texture_map: NDArray[np.uint8]):
-        field_capacity = np.zeros_like(texture_map, dtype=np.float32)
-        wilting_point = np.zeros_like(texture_map, dtype=np.float32)
-        max_infiltration_rate = np.zeros_like(texture_map, dtype=np.float32)
-        
-
-        for soil_id, params in SOIL_PARAMETERS.items():
-            mask = texture_map == soil_id
-            field_capacity[mask] = params["fc"]
-            wilting_point[mask] = params["wp"]
-            max_infiltration_rate[mask] = params["fmax"]
+        field_capacity, wilting_point, max_infiltration_rate = _build_soil_property_rasters(texture_map)
 
         return cls(
             texture_map=texture_map,
@@ -92,7 +138,7 @@ class Soil:
         pass
 
     @classmethod
-    def from_soilgrid(cls, reference_path, output_folder=None) -> "Soil":
+    def from_soilgrid(cls, reference_path, output_folder=None, fill_holes: bool = False) -> "Soil":
 
         try:
             from soilgrids import SoilGrids
@@ -174,35 +220,72 @@ class Soil:
 
         ## Convert soil layers to mosaics for each depth layer
         print("Averaging soil layers and align to mask")
-        search_terms = ['*0-5*.tif', '*5-15*.tif', '*15-30*.tif', '*30-60*.tif', '*60-100*.tif', '*100-200*.tif'] # search files of different soil types
         target_dir_processed = os.path.join(output_folder, 'soilgrids_processed')
         os.makedirs(target_dir_processed, exist_ok=True)
+
+        depth_aliases = {
+            "0-5": 5.0,
+            "5-15": 10.0,
+            "15-30": 15.0,
+            "30-60": 30.0,
+            "60-100": 40.0,
+            "100-200": 100.0,
+        }
+        ordered_depths = [
+            "0-5",
+            "5-15",
+            "15-30",
+            "30-60",
+            "60-100",
+            "100-200",
+        ]
+
         ref_path = glob.glob(os.path.join(target_dir, '*0-5*.tif'))[0]
         with rasterio.open(ref_path) as src:
             ref = src.read(1)
             like_raster = np.zeros_like(ref)
+
         for soil_type in ['clay', 'sand', 'silt']:
-            
             targetfile = os.path.join(target_dir_processed, 'soil_' + soil_type + '_averaged.tif')
-            input_files = glob.glob(os.path.join(target_dir, f"{soil_type}_*mean.tif"))
-            depth_list_cm = [5, 10, 15, 30, 40, 100]
+            input_files = []
+            for depth_key in ordered_depths:
+                hits = sorted(glob.glob(os.path.join(target_dir, f"{soil_type}_*{depth_key}*mean.tif")))
+                if len(hits) != 1:
+                    raise FileNotFoundError(
+                        f"Expected exactly one {soil_type} raster for depth {depth_key}, found {len(hits)}."
+                    )
+                input_files.append(hits[0])
+
+            ref_profile.update(
+                dtype=rasterio.float32,
+                count=1,
+                nodata=np.nan,
+                compress="lzw",
+                driver="GTiff",
+            )
             if os.path.isfile(targetfile):
                 print(f" Skipping {targetfile}, already exists.")
                 with rasterio.open(targetfile) as src:
                     aligned = src.read(1).astype(np.float32)
+                    if src.profile.get("transform") != ref_transform or src.shape != ref_shape or src.crs != ref_crs:
+                        raise ValueError(f"Cached SoilGrids raster {targetfile} does not match the reference geometry.")
+                if fill_holes:
+                    aligned = np.where(ref_mask, aligned, np.nan)
+                    aligned = _fill_internal_nodata_holes(aligned, valid_mask=ref_mask)
+                    with rasterio.open(targetfile, "w", **ref_profile) as dst:
+                        dst.write(aligned, 1)
             else:
                 averaged, profile = weighted_average_rasters_by_depth(
                     raster_paths=input_files,
-                    depth_list_cm=[5, 10, 15, 30, 40, 100],
+                    depth_list_cm=[depth_aliases[depth_key] for depth_key in ordered_depths],
                 )
 
                 averaged = averaged / 10.0  # Convert from g/kg to %
-                averaged = np.where(averaged == 0, np.nan, averaged)
+                averaged = np.where(np.isfinite(averaged) & (averaged == 0), np.nan, averaged)
+                if fill_holes:
+                    averaged = _fill_internal_nodata_holes(averaged)
 
-                # SoilGrids values are continuous, so bilinear is usually appropriate.
                 src_array = averaged.astype(np.float32)
-
-                # Prepare destination array on the reference grid.
                 aligned = np.full(ref_shape, np.nan, dtype=np.float32)
 
                 reproject(
@@ -212,27 +295,18 @@ class Soil:
                     src_crs=profile["crs"],
                     dst_transform=ref_transform,
                     dst_crs=ref_crs,
+                    src_nodata=np.nan,
+                    dst_nodata=np.nan,
                     resampling=Resampling.bilinear,
                 )
 
-                # Clip to the valid reference footprint.
                 aligned = np.where(ref_mask, aligned, np.nan)
 
-                # Save on the exact reference grid.
-                ref_profile.update(
-                    dtype=rasterio.float32,
-                    count=1,
-                    nodata=np.nan,
-                    compress="lzw",
-                    driver="GTiff",
-                )
+                if fill_holes:
+                    aligned = _fill_internal_nodata_holes(aligned, valid_mask=ref_mask)
 
                 with rasterio.open(targetfile, "w", **ref_profile) as dst:
                     dst.write(aligned, 1)
-
-            cls.clay_raster = aligned if soil_type == 'clay' else cls.clay_raster
-            cls.sand_raster = aligned if soil_type == 'sand' else cls.sand_raster
-            cls.silt_raster = aligned if soil_type == 'silt' else cls.silt_raster
 
             if soil_type == 'clay':
                 clay_raster = aligned
@@ -254,6 +328,17 @@ class Soil:
             silt_raster=silt_raster,
         )
         soil.derive_usda_texture()
+
+        texture_target = os.path.join(target_dir_processed, 'soil_texture_map.tif')
+        texture_profile = ref_profile.copy()
+        texture_profile.update(dtype=rasterio.uint8, count=1, nodata=0, compress="lzw", driver="GTiff")
+        if os.path.isfile(texture_target):
+            print(f" Skipping {texture_target}, already exists.")
+        else:
+            with rasterio.open(texture_target, "w", **texture_profile) as dst:
+                dst.write(soil.texture_map.astype(np.uint8), 1)
+
+        soil.field_capacity, soil.wilting_point, soil.max_infiltration_rate = _build_soil_property_rasters(soil.texture_map)
         return soil
 
 
@@ -268,41 +353,54 @@ class Soil:
             raise ValueError("sand_raster, silt_raster, and clay_raster must be initialized first.")
 
         texture_codes = {
-            "Sand": 1,
-            "LoamySand": 2,
-            "SandyLoam": 3,
-            "Loam": 4,
-            "SiltLoam": 5,
+            "Sand": 13,
+            "LoamySand": 12,
+            "SandyLoam": 11,
+            "Loam": 9,
+            "SiltLoam": 7,
             "Silt": 6,
-            "SandyClayLoam": 7,
-            "ClayLoam": 8,
-            "SiltyClayLoam": 9,
-            "SandyClay": 10,
-            "SiltyClay": 11,
-            "Clay": 12,
+            "SandyClayLoam": 10,
+            "ClayLoam": 5,
+            "SiltyClayLoam": 4,
+            "SandyClay": 8,
+            "SiltyClay": 2,
+            "Clay": 3,
         }
 
         self.texture_map = np.zeros(self.sand_raster.shape, dtype=np.uint8)
 
-        sand = self.sand_raster
-        silt = self.silt_raster
-        clay = self.clay_raster
+        sand = np.asarray(self.sand_raster, dtype=np.float32)
+        silt = np.asarray(self.silt_raster, dtype=np.float32)
+        clay = np.asarray(self.clay_raster, dtype=np.float32)
 
-        sand_cls = (silt + 1.5 * clay < 15)
-        loamy_sand = ((silt + 1.5 * clay) >= 15) & ((silt + 2.0 * clay) < 30)
-        sandy_loam = (
+        valid_components = (
+            np.isfinite(sand)
+            & np.isfinite(silt)
+            & np.isfinite(clay)
+            & (sand >= 0.0)
+            & (silt >= 0.0)
+            & (clay >= 0.0)
+        )
+        total = sand + silt + clay
+        valid_components &= (total > 0.0) & (total <= 150)
+
+        self.texture_map = np.zeros(self.sand_raster.shape, dtype=np.uint8)
+
+        sand_cls = valid_components & (silt + 1.5 * clay < 15)
+        loamy_sand = valid_components & ((silt + 1.5 * clay) >= 15) & ((silt + 2.0 * clay) < 30)
+        sandy_loam = valid_components & (
             ((clay >= 7) & (clay < 20) & (sand > 52) & ((silt + 2.0 * clay) >= 30))
             | ((clay < 7) & (silt < 50) & ((silt + 2.0 * clay) >= 30))
         )
-        loam = (clay >= 7) & (clay < 27) & (silt >= 28) & (silt < 50) & (sand <= 52)
-        silt_loam = ((silt >= 50) & (clay >= 12) & (clay < 27)) | ((silt >= 50) & (silt < 80) & (clay < 12))
-        silt_cls = (silt >= 80) & (clay < 12)
-        sandy_clay_loam = (clay >= 20) & (clay < 35) & (silt < 28) & (sand > 45)
-        clay_loam = (clay >= 27) & (clay < 40) & (sand > 20) & (sand <= 45)
-        silty_clay_loam = (clay >= 27) & (clay < 40) & (sand <= 20)
-        sandy_clay = (clay >= 35) & (sand > 45)
-        silty_clay = (clay >= 40) & (silt >= 40)
-        clay_cls = (clay >= 40) & (sand <= 45) & (silt < 40)
+        loam = valid_components & (clay >= 7) & (clay < 27) & (silt >= 28) & (silt < 50) & (sand <= 52)
+        silt_loam = valid_components & (((silt >= 50) & (clay >= 12) & (clay < 27)) | ((silt >= 50) & (silt < 80) & (clay < 12)))
+        silt_cls = valid_components & (silt >= 80) & (clay < 12)
+        sandy_clay_loam = valid_components & (clay >= 20) & (clay < 35) & (silt < 28) & (sand > 45)
+        clay_loam = valid_components & (clay >= 27) & (clay < 40) & (sand > 20) & (sand <= 45)
+        silty_clay_loam = valid_components & (clay >= 27) & (clay < 40) & (sand <= 20)
+        sandy_clay = valid_components & (clay >= 35) & (sand > 45)
+        silty_clay = valid_components & (clay >= 40) & (silt >= 40)
+        clay_cls = valid_components & (clay >= 40) & (sand <= 45) & (silt < 40)
 
         self.texture_map[sand_cls] = texture_codes["Sand"]
         self.texture_map[loamy_sand] = texture_codes["LoamySand"]
@@ -316,6 +414,10 @@ class Soil:
         self.texture_map[sandy_clay] = texture_codes["SandyClay"]
         self.texture_map[silty_clay] = texture_codes["SiltyClay"]
         self.texture_map[clay_cls] = texture_codes["Clay"]
+
+        self.field_capacity, self.wilting_point, self.max_infiltration_rate = _build_soil_property_rasters(
+            self.texture_map
+        )
 
         return self.texture_map
 

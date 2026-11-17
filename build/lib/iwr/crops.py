@@ -208,7 +208,7 @@ class Crop:
             raise ValueError("root_max_depth must be > 0")
         if self.kc_initial < 0 or self.kc_max < 0 or self.kc_sen < 0:
             raise ValueError("Kc values must be >= 0")
-        if not 0 < self.p <= 1:
+        if not 0 <= self.p <= 1:
             raise ValueError("p must be between 0 and 1")
 
     @classmethod

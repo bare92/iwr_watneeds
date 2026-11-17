@@ -4,8 +4,17 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import glob
 import os
+import rasterio
 from rasterio.crs import CRS
-from rasterio.warp import transform_bounds
+from rasterio.enums import Resampling
+from rasterio.warp import transform_bounds, reproject
+
+
+def _clear_raster_env() -> None:
+    """Drop stale PROJ/GDAL env vars that can poison Rasterio CRS discovery."""
+    for key in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
+        os.environ.pop(key, None)
+
 
 def save_debug_raster_png(
     raster: np.ndarray,
@@ -72,8 +81,7 @@ def get_raster_alignment_reference(raster_path: str | Path) -> dict[str, object]
     if not raster_path.is_file():
         raise FileNotFoundError(raster_path)
 
-    for key in ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA"):
-        os.environ.pop(key, None)
+    _clear_raster_env()
 
     with rasterio.open(raster_path) as src:
         if src.crs is None:
@@ -161,6 +169,140 @@ def get_wgs84_extent_with_buffer(
         "bbox": (xmin, ymin, xmax, ymax),
     }
 
+def aggregate_fractional(
+    land_cover_path: str | Path,
+    class_mapping: pd.DataFrame,
+    reference_grid: str | Path,
+    output_path: str | Path | None = None,
+    value_col: str = "value",
+    class_name_col: str = "land_cover_name",
+    return_percentage: bool = False,
+) -> tuple[np.ndarray, dict] | np.ndarray:
+    """Aggregate a higher-resolution land-cover raster to a lower-resolution reference grid.
+
+    The raster is classified as either:
+
+    - categorical/class-presence data (binary masks or integer land-cover codes), or
+    - existing fractional data already stored in [0, 1].
+
+    The function retains zero-valued background pixels as valid data and masks only
+    true NoData values. The result is always returned on the reference grid and the
+    reference-domain mask is applied before writing the output.
+    """
+    required_columns = {value_col, class_name_col}
+    if not isinstance(class_mapping, pd.DataFrame):
+        raise TypeError("class_mapping must be a pandas.DataFrame")
+    if not required_columns.issubset(class_mapping.columns):
+        missing = sorted(required_columns - set(class_mapping.columns))
+        raise ValueError(
+            f"class_mapping is missing required columns: {missing}"
+        )
+
+    land_cover_path = Path(land_cover_path)
+    reference_grid = Path(reference_grid)
+
+    if not land_cover_path.is_file():
+        raise FileNotFoundError(land_cover_path)
+    if not reference_grid.is_file():
+        raise FileNotFoundError(reference_grid)
+
+    _clear_raster_env()
+
+    class_df = class_mapping[[value_col, class_name_col]].drop_duplicates().copy()
+    class_df[value_col] = pd.to_numeric(class_df[value_col], errors="raise")
+
+    with rasterio.open(land_cover_path) as src:
+        source = src.read(1).astype(np.float32)
+        source_profile = src.profile.copy()
+        source_transform = src.transform
+        source_crs = src.crs
+        source_nodata = src.nodata
+
+        if source_nodata is not None and not np.isclose(float(source_nodata), 0.0):
+            source[source == source_nodata] = np.nan
+
+    with rasterio.open(reference_grid) as ref:
+        ref_profile = ref.profile.copy()
+        ref_shape = (ref.height, ref.width)
+        ref_transform = ref.transform
+        ref_crs = ref.crs
+        ref_valid = np.isfinite(ref.read(1).astype(np.float32))
+
+    if source_crs != ref_crs:
+        raise ValueError(
+            f"CRS mismatch between land cover ({source_crs}) and reference grid ({ref_crs})."
+        )
+
+    class_values = class_df[value_col].astype(np.float32).tolist()
+    class_names = class_df[class_name_col].astype(str).tolist()
+
+    finite_values = np.asarray(source[np.isfinite(source)], dtype=np.float32)
+    if finite_values.size == 0:
+        raise ValueError("No finite values were found in the land-cover raster.")
+
+    integer_like = np.all(np.isclose(finite_values, np.round(finite_values)))
+    use_categorical = integer_like or np.any(
+        np.isin(np.unique(finite_values), np.asarray(class_values, dtype=np.float32))
+    )
+
+    fractional_stack = np.full(
+        (len(class_values), ref_shape[0], ref_shape[1]),
+        np.nan,
+        dtype=np.float32,
+    )
+
+    for band_index, land_cover_value in enumerate(class_values):
+        if use_categorical:
+            indicator = np.full(source.shape, 0.0, dtype=np.float32)
+            valid_source = np.isfinite(source)
+            indicator[valid_source & (source == land_cover_value)] = 1.0
+            source_for_reproject = indicator
+            source_nodata = np.nan
+        else:
+            source_for_reproject = source.copy()
+            source_nodata = np.nan
+
+        destination = np.full(ref_shape, np.nan, dtype=np.float32)
+        reproject(
+            source=source_for_reproject,
+            destination=destination,
+            src_transform=source_transform,
+            src_crs=source_crs,
+            dst_transform=ref_transform,
+            dst_crs=ref_crs,
+            src_nodata=source_nodata,
+            dst_nodata=np.nan,
+            resampling=Resampling.average,
+        )
+
+        destination[~ref_valid] = np.nan
+        if return_percentage:
+            destination *= 100.0
+        fractional_stack[band_index] = destination
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        output_profile = ref_profile.copy()
+        output_profile.update(
+            driver="GTiff",
+            count=len(class_values),
+            dtype=rasterio.float32,
+            nodata=np.nan,
+            compress="lzw",
+        )
+
+        with rasterio.open(output_path, "w", **output_profile) as dst:
+            dst.write(fractional_stack)
+            for band_number, description in enumerate(class_names, start=1):
+                dst.set_band_description(band_number, str(description))
+
+        return fractional_stack, output_profile
+
+    return fractional_stack
+
+
 def build_forcing_dataframe(
     precipitation_folder: str,
     pet_folder: str,
@@ -207,6 +349,8 @@ def build_forcing_dataframe(
 from pathlib import Path
 
 import numpy as np
+import re
+
 import pandas as pd
 import rasterio
 
@@ -238,315 +382,167 @@ import pandas as pd
 import rasterio
 
 
+def _date_from_iwr_raster_name(path: str | Path) -> str | None:
+    """Return YYYY_MM_DD from filenames such as iwr_2024_01_31.tif or iwr_2024_01_31_maize.tif."""
+    stem = Path(path).stem
+    match = re.search(r"iwr_(\d{4})_(\d{2})_(\d{2})(?:_.*)?$", stem)
+    if match is None:
+        return None
+    return f"{match.group(1)}_{match.group(2)}_{match.group(3)}"
+
+
 def aggregate_crops_iwr(
-    output_dir: str | Path,
-    crop_fractions_path: str | Path,
-    scheduler: pd.DataFrame,
-    crop_band_map: dict[int, str],
-    start_date: str | None = None,
-    end_date: str | None = None,
-    output_folder_name: str = "aggregated_iwr",
-) -> None:
-    """
-    Aggregate crop-specific IWR rasters as a crop-fraction-weighted average.
-
-    For each pixel and timestep:
-
-        IWR_aggregated =
-            sum(fraction_c * IWR_c)
-            -----------------------
-
-    The output therefore represents the mean IWR [mm] over the
-    cropped/irrigated fraction of the pixel, NOT the equivalent depth
-    over the entire pixel.
-
-    Pixels with total crop fraction == 0 are written as NaN.
+    output_dir: str | Path | None = None,
+    model_output_dir: str | Path | dict | None = None,
+    crop_names: list[str] | None = None,
+    crop_fractions: dict[str, str | Path | np.ndarray] | str | Path | None = None,
+) -> Path:
+    """Aggregate crop-specific IWR rasters to daily whole-domain values.
 
     Parameters
     ----------
-    output_dir : str or Path
-        Main output directory containing crop-specific folders.
+    output_dir : str | Path | None
+        Directory where the aggregated rasters should be written.
+    model_output_dir : str | Path | dict | None
+        Either the root folder containing crop subfolders or a dictionary containing
+        the keys ``model_output_dir`` and ``fractional_land_cover``/``crop_fractions``.
+    crop_names : list[str] | None
+        Crop names to aggregate. If omitted, they are inferred from the fraction dict.
+    crop_fractions : dict[str, ...] | str | Path | None
+        Fraction raster(s) for each crop. When provided, the aggregation is performed
+        as a weighted average using the crop fractions. When omitted, a pure sum is
+        returned for compatibility with the existing pipeline.
 
-        Expected structure:
-
-            output_dir/
-                maize/
-                    iwr/
-                        iwr_YYYY_MM_DD_maize.tif
-                wheat/
-                    iwr/
-                        iwr_YYYY_MM_DD_wheat.tif
-                ...
-
-    crop_fractions_path : str or Path
-        Multiband raster containing crop fractions in the range [0, 1].
-
-    scheduler : pandas.DataFrame
-        Scheduler containing a "time" column.
-
-    crop_band_map : dict[int, str]
-        Mapping between 1-based raster band number and crop name.
-
-        Example:
-
-            {
-                1: "barley",
-                5: "maize",
-                20: "vineyard",
-            }
-
-    start_date, end_date : str, optional
-        Optional date limits.
-
-    output_folder_name : str
-        Name of output folder.
+    Returns
+    -------
+    Path
+        Directory containing the output rasters.
     """
+    if isinstance(model_output_dir, dict):
+        config = model_output_dir
+        if output_dir is None:
+            output_dir = config.get("output_dir")
+        model_output_dir = config.get("model_output_dir") or config.get("model_output_folder")
+        if crop_names is None:
+            crop_names = config.get("crop_names")
+        if crop_fractions is None:
+            crop_fractions = config.get("fractional_land_cover") or config.get("crop_fractions")
+
+    if output_dir is None:
+        raise ValueError("output_dir must be provided.")
+    if model_output_dir is None:
+        raise ValueError("model_output_dir must be provided.")
 
     output_dir = Path(output_dir)
-    crop_fractions_path = Path(crop_fractions_path)
+    model_output_dir = Path(model_output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --------------------------------------------------------------
-    # Scheduler
-    # --------------------------------------------------------------
+    if crop_names is None:
+        if crop_fractions is None:
+            raise ValueError("crop_names or crop_fractions must be provided.")
+        if isinstance(crop_fractions, dict):
+            crop_names = list(crop_fractions.keys())
+        elif isinstance(crop_fractions, (str, Path)):
+            raise ValueError("When crop_fractions is a single raster, crop_names must be provided.")
+        else:
+            raise TypeError("crop_fractions must be a dict, raster path, or array dictionary.")
 
-    current_scheduler = scheduler.copy()
+    crop_names = [str(name) for name in crop_names]
 
-    current_scheduler["time"] = pd.to_datetime(
-        current_scheduler["time"]
-    )
-
-    if start_date is not None:
-        current_scheduler = current_scheduler[
-            current_scheduler["time"] >= pd.Timestamp(start_date)
-        ]
-
-    if end_date is not None:
-        current_scheduler = current_scheduler[
-            current_scheduler["time"] <= pd.Timestamp(end_date)
-        ]
-
-    if current_scheduler.empty:
-        raise ValueError(
-            "No timesteps remain after applying the requested date range."
-        )
-
-    # --------------------------------------------------------------
-    # Read crop fractions
-    # --------------------------------------------------------------
-
-    with rasterio.open(crop_fractions_path) as src:
-
-        fractions = src.read().astype(np.float32)
-
-        profile = src.profile.copy()
-
-        fraction_shape = (src.height, src.width)
-        fraction_transform = src.transform
-        fraction_crs = src.crs
-
-        nodata = src.nodata
-
-    if nodata is not None:
-        fractions[fractions == nodata] = np.nan
-
-    fractions = _normalize_crop_fractions(fractions)
-
-    # --------------------------------------------------------------
-    # Validate fractions
-    # --------------------------------------------------------------
-
-    finite = np.isfinite(fractions)
-
-    if np.any(fractions[finite] < 0.0):
-        raise ValueError(
-            "crop fraction raster contains values < 0."
-        )
-
-    if np.any(fractions[finite] > 1.0 + 1e-6):
-        raise ValueError(
-            "crop fraction raster contains values > 1. "
-            "Expected fractions in [0, 1]."
-        )
-
-    if max(crop_band_map) > fractions.shape[0]:
-        raise ValueError(
-            "crop_band_map refers to a band that does not exist "
-            "in crop_fractions_path."
-        )
-
-    # --------------------------------------------------------------
-    # Output directory
-    # --------------------------------------------------------------
-
-    aggregated_folder = (
-        output_dir / output_folder_name
-    )
-
-    aggregated_folder.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    profile.update(
-        driver="GTiff",
-        dtype=rasterio.float32,
-        count=1,
-        compress="lzw",
-        nodata=np.nan,
-    )
-
-    # --------------------------------------------------------------
-    # Loop over timesteps
-    # --------------------------------------------------------------
-
-    for _, row in current_scheduler.iterrows():
-
-        timestamp = pd.Timestamp(row["time"])
-
-        formatted_time = timestamp.strftime(
-            "%Y_%m_%d"
-        )
-
-        # Numerator:
-        #
-        #     sum(fraction * IWR)
-        weighted_iwr_sum = np.zeros(
-            fraction_shape,
-            dtype=np.float32,
-        )
-
-        # Denominator:
-        #
-        #     sum(fraction)
-        fraction_sum = np.zeros(
-            fraction_shape,
-            dtype=np.float32,
-        )
-
-        crops_used = 0
-
-        # ----------------------------------------------------------
-        # Loop over crops
-        # ----------------------------------------------------------
-
-        for band_number, crop_name in crop_band_map.items():
-
-            # rasterio bands are 1-based, numpy arrays are 0-based
-            band_index = band_number - 1
-
-            crop_fraction = fractions[band_index]
-
-            iwr_path = (
-                output_dir
-                / crop_name
-                / "iwr"
-                / f"iwr_{formatted_time}_{crop_name}.tif"
-            )
-
-            if not iwr_path.exists():
-                print(
-                    f"WARNING: missing IWR raster: {iwr_path}"
+    if crop_fractions is None:
+        crop_fraction_map = {crop_name: None for crop_name in crop_names}
+    elif isinstance(crop_fractions, dict):
+        crop_fraction_map = {}
+        for crop_name, fraction in crop_fractions.items():
+            fraction_path_or_array = fraction
+            if isinstance(fraction_path_or_array, (str, Path)):
+                with rasterio.open(fraction_path_or_array) as src:
+                    fraction_array = src.read(1).astype(np.float32)
+            elif isinstance(fraction_path_or_array, np.ndarray):
+                fraction_array = np.asarray(fraction_path_or_array, dtype=np.float32)
+            else:
+                raise TypeError(f"Unsupported fraction type for crop {crop_name!r}: {type(fraction_path_or_array)!r}")
+            crop_fraction_map[str(crop_name)] = fraction_array
+    elif isinstance(crop_fractions, (str, Path)):
+        with rasterio.open(crop_fractions) as src:
+            if src.count < len(crop_names):
+                raise ValueError(
+                    "crop_fractions raster has fewer bands than crop_names. "
+                    "Expected one band per crop in the same order as crop_names."
                 )
+        with rasterio.open(crop_fractions) as src:
+            band_arrays = [src.read(band_index + 1).astype(np.float32) for band_index in range(src.count)]
+        crop_fraction_map = {str(crop_names[index]): band_arrays[index] for index in range(len(crop_names))}
+    else:
+        raise TypeError("crop_fractions must be a dict, raster path, or None.")
+
+    daily_files: dict[str, dict[str, Path]] = {}
+    for crop_name in crop_names:
+        crop_iwr_dir = model_output_dir / crop_name / "iwr"
+        if not crop_iwr_dir.exists():
+            continue
+        for file_path in sorted(crop_iwr_dir.glob("iwr_*.tif")):
+            date_key = _date_from_iwr_raster_name(file_path)
+            if date_key is None:
                 continue
+            daily_files.setdefault(date_key, {})[crop_name] = file_path
 
-            with rasterio.open(iwr_path) as src:
+    if not daily_files:
+        raise FileNotFoundError(f"No IWR rasters were found under {model_output_dir}.")
 
-                # --------------------------------------------------
-                # Grid consistency
-                # --------------------------------------------------
+    out_dir = output_dir / "aggregated_iwr_crops"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-                if src.shape != fraction_shape:
+    for date_key, crop_paths in sorted(daily_files.items()):
+        reference_path = next(iter(crop_paths.values()))
+        with rasterio.open(reference_path) as src:
+            ref_profile = src.profile.copy()
+            reference_data = src.read(1).astype(np.float32)
+
+        weighted_sum = np.zeros_like(reference_data, dtype=np.float64)
+        weight_total = np.zeros_like(reference_data, dtype=np.float64)
+        used_any = False
+
+        for crop_name, crop_path in crop_paths.items():
+            with rasterio.open(crop_path) as src:
+                crop_data = src.read(1).astype(np.float32)
+
+            if crop_name in crop_fraction_map and crop_fraction_map[crop_name] is not None:
+                fraction = np.asarray(crop_fraction_map[crop_name], dtype=np.float32)
+                if fraction.shape != crop_data.shape:
                     raise ValueError(
-                        f"Shape mismatch for {iwr_path}: "
-                        f"{src.shape} != {fraction_shape}"
+                        f"Fraction raster for crop {crop_name!r} has shape {fraction.shape}, "
+                        f"but IWR raster has shape {crop_data.shape}."
                     )
+                fraction = np.nan_to_num(fraction, nan=0.0, posinf=0.0, neginf=0.0)
+            else:
+                fraction = np.ones_like(crop_data, dtype=np.float32)
 
-                if src.transform != fraction_transform:
-                    raise ValueError(
-                        f"Transform mismatch for {iwr_path}"
-                    )
+            if np.any(np.isfinite(crop_data)):
+                used_any = True
 
-                if src.crs != fraction_crs:
-                    raise ValueError(
-                        f"CRS mismatch for {iwr_path}"
-                    )
+            crop_weighted = np.nan_to_num(crop_data, nan=0.0, posinf=0.0, neginf=0.0) * fraction
+            weighted_sum += crop_weighted
+            weight_total += np.nan_to_num(fraction, nan=0.0, posinf=0.0, neginf=0.0)
 
-                iwr_data = src.read(1).astype(
-                    np.float32
-                )
-
-                iwr_nodata = src.nodata
-
-            if iwr_nodata is not None:
-                iwr_data[
-                    iwr_data == iwr_nodata
-                ] = np.nan
-
-            # ------------------------------------------------------
-            # Valid contribution
-            # ------------------------------------------------------
-
-            valid = (
-                np.isfinite(crop_fraction)
-                & np.isfinite(iwr_data)
-                & (crop_fraction > 0.0)
+        if not used_any:
+            aggregated = np.full_like(reference_data, np.nan, dtype=np.float32)
+        else:
+            aggregated = np.divide(
+                weighted_sum,
+                weight_total,
+                out=np.full_like(weighted_sum, np.nan, dtype=np.float64),
+                where=weight_total > 0,
             )
+            aggregated = np.asarray(aggregated, dtype=np.float32)
 
-            # Numerator
-            weighted_iwr_sum[valid] += (
-                crop_fraction[valid]
-                * iwr_data[valid]
-            )
+        output_path = out_dir / f"iwr_{date_key}.tif"
+        profile = ref_profile.copy()
+        profile.update(driver="GTiff", count=1, dtype=rasterio.float32, nodata=np.nan, compress="lzw")
+        with rasterio.open(output_path, "w", **profile) as dst:
+            dst.write(aggregated, 1)
 
-            # Denominator
-            fraction_sum[valid] += (
-                crop_fraction[valid]
-            )
-
-            crops_used += 1
-
-        # ----------------------------------------------------------
-        # Weighted average
-        # ----------------------------------------------------------
-
-        aggregated_iwr = np.full(
-            fraction_shape,
-            np.nan,
-            dtype=np.float32,
-        )
-
-        valid_pixels = fraction_sum > 0.0
-
-        aggregated_iwr[valid_pixels] = (
-            weighted_iwr_sum[valid_pixels]
-            / fraction_sum[valid_pixels]
-        )
-
-        # ----------------------------------------------------------
-        # Save
-        # ----------------------------------------------------------
-
-        output_path = (
-            aggregated_folder
-            / f"iwr_{formatted_time}.tif"
-        )
-
-        with rasterio.open(
-            output_path,
-            "w",
-            **profile,
-        ) as dst:
-
-            dst.write(
-                aggregated_iwr,
-                1,
-            )
-
-        print(
-            f"Saved weighted-average IWR: "
-            f"{output_path} "
-            f"({crops_used} crops)"
-        )
+    return out_dir
 
 from pathlib import Path
 import numpy as np
@@ -755,3 +751,4 @@ def weighted_average_rasters_by_depth(
         averaged[valid_pixels] = weighted_sum[valid_pixels] / weight_sum[valid_pixels]
 
         return averaged, profile
+

@@ -58,11 +58,11 @@ with rasterio.open(soil_texture_path) as soil_texture_src:
 
 # define soil object
 
-soil = iwr.Soil.from_soilgrid(reference_path=working_grid_path, output_folder=static_folder)
+#soil = iwr.Soil.from_soilgrid(reference_path=working_grid_path, output_folder=static_folder)
 
 
 
-#soil = iwr.Soil.from_texture(soil_texture)
+soil = iwr.Soil.from_texture(soil_texture)
 soil.initialize_SM_from_string("field_capacity")  # Initialize soil moisture from string
 # load phenology from ASAP
 phenoe1 = rasterio.open(f"{static_folder}/phenoe1_v04_aligned.tif").read(1)
@@ -118,11 +118,11 @@ CROP_BANDS = {
 
 
 
-# plot_yearly_iwr(
-#     iwr_folder="/home/fremen/data/projects/DAO/02_outputs/aggregated_iwr",
-#     plot_out_folder="/home/fremen/data/projects/DAO/03_plots",
-#     reference_value=1311,
-# )
+plot_yearly_iwr(
+    iwr_folder="/home/fremen/data/projects/DAO/02_outputs/aggregated_iwr",
+    plot_out_folder="/home/fremen/data/projects/DAO/03_plots",
+    reference_value=1311,
+)
 
 
 
@@ -142,8 +142,10 @@ for band_index, crop_name in CROP_BANDS.items():
         soil=soil, #object of Soil class
         working_grid=working_grid,
         phenology=phenology,
-        debug_mode=False,  # Enable debug mode to save intermediate outputs
-        irrigation_mask=irrigation_mask  # Pass the irrigation mask to the model
+        debug_mode=False,
+        report_blue_water_requirement=True,
+        simulate_irrigation=False,
+        irrigation_area_mask=irrigation_mask,
     )
     iwr_model = iwr.IWRModel(inputs)
 
@@ -180,9 +182,7 @@ for band_index, crop_name in CROP_BANDS.items():
 
 aggregate_crops_iwr(
     output_dir=outputs_folder,
-    crop_fractions_path=crop_fraction_path,
-    scheduler=schedule_df,
-    crop_band_map=CROP_BANDS,
+    crop_names=list(CROP_BANDS.values()),
 )
 
 print("IWR aggregation completed.")

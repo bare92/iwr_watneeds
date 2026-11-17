@@ -37,6 +37,7 @@ class IWRModel:
         self.soil_moisture_mm = None
         self.TAW = None
         self.RAW = None
+        self.critical_storage_mm = None
         self._last_balance_correction_stats = None
         if inputs.irrigation_mask is not None:
             self.valid_mask = np.logical_and(self.inputs.working_grid, self.inputs.crop.crop_raster > 0)
@@ -55,8 +56,8 @@ class IWRModel:
             if self.inputs.working_grid.shape != self.inputs.crop.crop_raster.shape[-2:]:
                 raise ValueError("working_grid and crop_raster spatial dimensions do not match.")
 
-        if self.inputs.crop.root_max_depth <= 0:
-            raise ValueError("crop.root_max_depth must be > 0.")
+        if not np.isfinite(self.inputs.crop.root_max_depth) or self.inputs.crop.root_max_depth <= 0:
+            raise ValueError("crop.root_max_depth must be a finite value > 0.")
 
         if not 0.0 <= self.inputs.crop.p <= 1.0:
             raise ValueError("crop.p must be between 0 and 1.")
@@ -64,6 +65,13 @@ class IWRModel:
         field_capacity = np.asarray(self.inputs.soil.field_capacity, dtype=np.float32)
         wilting_point = np.asarray(self.inputs.soil.wilting_point, dtype=np.float32)
         max_infiltration = np.asarray(self.inputs.soil.max_infiltration_rate, dtype=np.float32)
+
+        if not np.all(np.isfinite(field_capacity)):
+            raise ValueError("soil field_capacity contains NaN or infinite values.")
+        if not np.all(np.isfinite(wilting_point)):
+            raise ValueError("soil wilting_point contains NaN or infinite values.")
+        if not np.all(np.isfinite(max_infiltration)):
+            raise ValueError("soil.max_infiltration_rate contains NaN or infinite values.")
 
         if np.any((field_capacity < 0.0) | (field_capacity > 1.0)):
             raise ValueError("soil field_capacity must be a volumetric fraction in the range [0, 1].")
@@ -83,9 +91,10 @@ class IWRModel:
         iwr_path, et_actual_path, soil_moisture_path = self.create_output_directory()
         print(f"RUN {self.inputs.crop.name} from {self.inputs.scheduler['time'].min()} to {self.inputs.scheduler['time'].max()}")
 
-        # TAW and RAW are static for the current crop + soil combination, in mm.
+        # TAW, RAW and critical_storage_mm are static for the current crop + soil combination, in mm.
         self.TAW = self._compute_TAW()
         self.RAW = self._compute_RAW()
+        self.critical_storage_mm = self._compute_critical_storage()
 
         self.soil_moisture_mm = self._volumetric_to_storage(self.inputs.soil.soil_moisture)
         self.soil_moisture_mm = np.clip(self.soil_moisture_mm, 0.0, self.TAW)
@@ -271,55 +280,82 @@ class IWRModel:
         return theta_wp + storage_mm / (root_depth_m * 1000.0)
 
     def _compute_RAW(self) -> NDArray[np.float32]:
-        # RAW = p * TAW, both in mm.
+        # RAW = p * TAW, both in mm. This is the FAO-56 depletion threshold,
+        # not the remaining storage at which stress begins.
         if self.TAW is None:
             self.TAW = self._compute_TAW()
         return self.inputs.crop.p * self.TAW
 
+    def _compute_critical_storage(self) -> NDArray[np.float32]:
+        # critical_storage_mm = TAW - RAW = (1 - p) * TAW.
+        # This is the remaining soil water storage at the onset of stress.
+        if self.TAW is None:
+            self.TAW = self._compute_TAW()
+        critical_storage_mm = (1.0 - self.inputs.crop.p) * self.TAW
+        if not np.all(np.isfinite(critical_storage_mm)):
+            raise ValueError("critical_storage_mm contains NaN or infinite values.")
+        return np.asarray(critical_storage_mm, dtype=np.float32)
+
     def _compute_TAW(self) -> NDArray[np.float32]:
         # TAW = (FC - WP) * root_depth * 1000, in mm.
-        return (self.inputs.soil.field_capacity - self.inputs.soil.wilting_point) * self.inputs.crop.root_max_depth * 1000.0
+        taw = (self.inputs.soil.field_capacity - self.inputs.soil.wilting_point) * self.inputs.crop.root_max_depth * 1000.0
+        if not np.all(np.isfinite(taw)):
+            raise ValueError("Soil parameters produced non-finite TAW values.")
+        if np.any(taw <= 0.0):
+            raise ValueError("TAW must be > 0 for a valid soil-water stress calculation.")
+        return np.asarray(taw, dtype=np.float32)
 
     def _compute_ks(self) -> NDArray[np.float32]:
-        # Ks = S / RAW if S < RAW, else Ks = 1; must remain between 0 and 1.
+        # Ks = 1 if S >= critical_storage_mm; otherwise Ks = S / critical_storage_mm.
+        # The onset-of-stress threshold is the remaining storage, not the depletion amount.
         if self.soil_moisture_mm is None:
             if self.inputs.soil.soil_moisture is None:
                 raise ValueError("soil_moisture must be initialized before computing Ks.")
             self.soil_moisture_mm = self._volumetric_to_storage(self.inputs.soil.soil_moisture)
             self.soil_moisture_mm = np.clip(self.soil_moisture_mm, 0.0, self.TAW)
 
+        if self.critical_storage_mm is None:
+            self.critical_storage_mm = self._compute_critical_storage()
+
         soil_storage = np.asarray(self.soil_moisture_mm, dtype=np.float32)
-        raw = np.asarray(self.RAW, dtype=np.float32)
+        critical_storage = np.asarray(self.critical_storage_mm, dtype=np.float32)
         ks = np.ones_like(soil_storage, dtype=np.float32)
-        valid = np.isfinite(soil_storage) & np.isfinite(raw) & (raw > 0.0)
-        invalid_mask = valid & (soil_storage < raw)
-        ks[invalid_mask] = soil_storage[invalid_mask] / raw[invalid_mask]
+        valid = np.isfinite(soil_storage) & np.isfinite(critical_storage)
+        stress_pixels = valid & (critical_storage > 0.0) & (soil_storage < critical_storage)
+        ks[stress_pixels] = soil_storage[stress_pixels] / critical_storage[stress_pixels]
         ks = np.clip(ks, 0.0, 1.0)
         ks[~np.isfinite(soil_storage)] = np.nan
         return ks
 
     def _compute_deep_percolation(self) -> NDArray[np.float32]:
-        # D = Fmax * (S - RAW)/(TAW - RAW) for RAW <= S <= TAW; D = 0 otherwise.
+        # D = Fmax * (S - critical_storage_mm) / (TAW - critical_storage_mm)
+        # when S >= critical_storage_mm; otherwise D = 0.
         if self.soil_moisture_mm is None:
             if self.inputs.soil.soil_moisture is None:
                 raise ValueError("soil_moisture must be initialized before computing deep percolation.")
             self.soil_moisture_mm = self._volumetric_to_storage(self.inputs.soil.soil_moisture)
             self.soil_moisture_mm = np.clip(self.soil_moisture_mm, 0.0, self.TAW)
 
+        if self.critical_storage_mm is None:
+            self.critical_storage_mm = self._compute_critical_storage()
+
         soil_storage = np.asarray(self.soil_moisture_mm, dtype=np.float32)
-        raw = np.asarray(self.RAW, dtype=np.float32)
+        critical_storage = np.asarray(self.critical_storage_mm, dtype=np.float32)
         taw = np.asarray(self.TAW, dtype=np.float32)
         deep_percolation = np.zeros_like(soil_storage, dtype=np.float32)
-        denominator = taw - raw
-        valid = np.isfinite(soil_storage) & np.isfinite(denominator)
-        valid &= denominator != 0.0
-        valid &= soil_storage >= raw
+
+        denominator = taw - critical_storage
+        valid = np.isfinite(soil_storage) & np.isfinite(critical_storage) & np.isfinite(denominator)
+        valid &= denominator > 0.0
+        valid &= soil_storage >= critical_storage
         valid &= soil_storage <= taw
 
-        relative_storage = np.zeros_like(soil_storage, dtype=np.float32)
-        relative_storage[valid] = ((soil_storage[valid] - raw[valid]) / denominator[valid])
-        relative_storage = np.clip(relative_storage, 0.0, 1.0)
-        deep_percolation = self.inputs.soil.max_infiltration_rate * relative_storage
+        deep_percolation[valid] = (
+            self.inputs.soil.max_infiltration_rate[valid]
+            * (soil_storage[valid] - critical_storage[valid])
+            / denominator[valid]
+        )
+        deep_percolation = np.maximum(deep_percolation, 0.0)
         deep_percolation[~np.isfinite(soil_storage)] = np.nan
         return deep_percolation
 

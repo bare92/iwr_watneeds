@@ -47,3 +47,37 @@ def test_plot_yearly_iwr_creates_barplot_and_reference_line(tmp_path):
     summary = plot.summarize_yearly_iwr(iwr_dir)
     assert list(summary["year"]) == [2022, 2023]
     assert summary.loc[summary["year"] == 2022, "million_m3"].iloc[0] > 0
+
+
+def test_plot_yearly_iwr_uses_crop_fraction_when_summing_volume(tmp_path):
+    iwr_dir = tmp_path / "iwr_data"
+    iwr_dir.mkdir()
+
+    year_2022 = np.array([[100.0, 100.0], [100.0, 100.0]], dtype="float32")
+    crop_fraction = np.array([[0.5, 0.5], [0.5, 0.5]], dtype="float32")
+
+    _write_raster(iwr_dir / "iwr_2022_01_01.tif", year_2022)
+
+    summary = plot.summarize_yearly_iwr(iwr_dir, crop_raster=crop_fraction)
+
+    expected_m3 = float(np.sum(year_2022 * crop_fraction) * 1e-3 * 5000 * 5000)
+    np.testing.assert_allclose(summary.loc[summary["year"] == 2022, "m3"].iloc[0], expected_m3)
+    np.testing.assert_allclose(summary.loc[summary["year"] == 2022, "million_m3"].iloc[0], expected_m3 / 1_000_000.0)
+
+
+def test_plot_yearly_iwr_includes_crop_name_in_filename(tmp_path):
+    iwr_dir = tmp_path / "iwr_data"
+    iwr_dir.mkdir()
+
+    year_2022 = np.array([[100.0, 100.0], [100.0, 100.0]], dtype="float32")
+    _write_raster(iwr_dir / "iwr_2022_01_01.tif", year_2022)
+
+    out_dir = tmp_path / "plots"
+    result = plot.plot_yearly_iwr(
+        iwr_folder=iwr_dir,
+        plot_out_folder=out_dir,
+        crop_name="grassland",
+    )
+
+    assert result.exists()
+    assert result.name == "yearly_iwr_grassland.png"

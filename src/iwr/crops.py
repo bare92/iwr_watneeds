@@ -208,7 +208,7 @@ class Crop:
             raise ValueError("root_max_depth must be > 0")
         if self.kc_initial < 0 or self.kc_max < 0 or self.kc_sen < 0:
             raise ValueError("Kc values must be >= 0")
-        if not 0 < self.p <= 1:
+        if not 0 <= self.p <= 1:
             raise ValueError("p must be between 0 and 1")
 
     @classmethod
@@ -221,8 +221,18 @@ class Crop:
 
     @classmethod
     def custom(cls, crop_name: str, **overrides):
-        data = CROP_LIBRARY[crop_name].copy()
+        data = CROP_LIBRARY[crop_name].copy() if crop_name in CROP_LIBRARY else {"name": crop_name}
+        if "name" not in data:
+            data["name"] = crop_name
         data.update(overrides)
+
+        required_fields = {"name", "root_max_depth", "kc_initial", "kc_max", "kc_sen", "p"}
+        missing_fields = sorted(required_fields - data.keys())
+        if missing_fields:
+            raise ValueError(
+                f"Missing required crop parameters for '{crop_name}': {missing_fields}"
+            )
+
         return cls(**data)
 
     @classmethod
